@@ -4,86 +4,171 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
 
-const rooms = {}; 
-const globalData = new Map(); 
-const leaderboard = []; // 建立排行榜記憶體
+// 動態房間管理
+const rooms = {};
+
+// 進度儲存與排行榜
+const savedProgress = {};
+const leaderboard = [];
 
 io.on('connection', (socket) => {
-    // 加入房間
+    console.log(`有玩家連線進來了: ${socket.id}`);
+
+    // 玩家請求加入房間（支援動態建立）
     socket.on('join-room', (roomId, playerName) => {
-        if (!rooms[roomId]) rooms[roomId] = { players: {} };
+        if (!rooms[roomId]) {
+            rooms[roomId] = { players: {}, hostId: socket.id };
+        }
+
+        const roomPlayers = rooms[roomId].players;
+        const playerKeys = Object.keys(roomPlayers);
+
+        if (playerKeys.length >= 4) {
+            socket.emit('room-full', '這個房間已經滿了（最多 4 人）！');
+            return;
+        }
+
         socket.join(roomId);
         socket.currentRoom = roomId;
-        rooms[roomId].players[socket.id] = { id: socket.id, name: playerName, x: 0, y: 0, angle: 0, lap: 1 };
-        io.to(roomId).emit('update-room-users', rooms[roomId].players);
+
+        roomPlayers[socket.id] = {
+            id: socket.id,
+            name: playerName || '車手',
+            x: 0, y: 0, angle: 0,
+            lap: 1, prevWaypoint: 0,
+            isRacing: false, isReady: false,
+            model: 'ae86'
+        };
+
+        // 如果房間沒有房主（原房主離開），指定新房主
+        if (!rooms[roomId].hostId || !roomPlayers[rooms[roomId].hostId]) {
+            rooms[roomId].hostId = socket.id;
+        }
+
+        console.log(`玩家 ${socket.id} (${playerName}) 加入了 ${roomId} (目前人數: ${playerKeys.length + 1}/4, 房主: ${rooms[roomId].hostId})`);
+
+        // 廣播時附帶房主資訊
+        io.to(roomId).emit('update-room-users', roomPlayers, rooms[roomId].hostId);
     });
 
-    // 房主按下開始遊戲
-    socket.on('start-online-match', (roomId) => {
-        io.to(roomId).emit('launch-match');
-    });
+    // 接收玩家在賽道上的即時位置與狀態，並廣播給同房其他人
+    socket.on('player-update', (data) => {
+        const roomId = socket.currentRoom;
+        if (roomId && rooms[roomId] && rooms[roomId].players[socket.id]) {
+            let p = rooms[roomId].players[socket.id];
+            if (data.x !== undefined) p.x = data.x;
+            if (data.y !== undefined) p.y = data.y;
+            if (data.angle !== undefined) p.angle = data.angle;
+            if (data.lap !== undefined) p.lap = data.lap;
+            if (data.speed !== undefined) p.speed = data.speed;
+            if (data.prevWaypoint !== undefined) p.prevWaypoint = data.prevWaypoint;
+            if (data.model !== undefined) p.model = data.model;
+            if (data.isRacing !== undefined) p.isRacing = data.isRacing;
+            if (data.isReady !== undefined) p.isReady = data.isReady;
+            if (data.inputs !== undefined) p.inputs = data.inputs;
 
-    // 獲取排行榜
-    socket.on('get-leaderboard', () => {
-        leaderboard.sort((a, b) => a.ms - b.ms); // 依秒數由小到大排序 (計時最短優先)
-        socket.emit('leaderboard-data', leaderboard.slice(0, 10)); // 僅回傳前 10 名
-    });
-
-    // 自動上傳成績事件 (加入賽道分類與防重複洗榜)
-    socket.on('upload-score', (data) => {
-        if(data.time && data.time !== "00:00.000" && data.time !== "00:00") {
-            let parts = data.time.split(':');
-            if(parts.length === 2) {
-                let secs = parts[1].split('.');
-                let ms = parseInt(parts[0]) * 60000 + parseInt(secs[0]) * 1000 + (secs[1] ? parseInt(secs[1]) : 0);
-
-                // 檢查是否已有該玩家在「同一賽道」的成績
-                let existingIndex = leaderboard.findIndex(r => r.name === data.name && r.track === data.track);
-                if (existingIndex !== -1) {
-                    // 若新成績比舊成績快，則覆蓋
-                    if (ms < leaderboard[existingIndex].ms) {
-                        leaderboard[existingIndex].time = data.time;
-                        leaderboard[existingIndex].ms = ms;
-                    }
-                } else {
-                    // 沒有紀錄則直接新增
-                    leaderboard.push({ name: data.name, track: data.track, time: data.time, ms: ms });
-                }
-                // 重新排序
-                leaderboard.sort((a, b) => a.ms - b.ms);
-            }
+            socket.to(roomId).emit('opponent-move', rooms[roomId].players);
         }
     });
 
-    // 儲存雲端繼承碼進度
+    // 房主請求開始比賽（可附帶賽道索引供同步）
+    socket.on('start-online-match', (roomId, trackIdx) => {
+        if (!rooms[roomId]) return;
+        const count = Object.keys(rooms[roomId].players).length;
+        if (count < 2) {
+            socket.emit('error-msg', '至少需要 2 名玩家才能開始比賽！');
+            return;
+        }
+        // 只有房主可以開賽
+        if (rooms[roomId].hostId !== socket.id) return;
+        io.to(roomId).emit('launch-match', trackIdx || 0);
+    });
+
+    // 儲存遊戲進度並產生繼承碼
     socket.on('save-progress', (data) => {
-        const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-        globalData.set(code, { name: data.name, progress: data.progress });
+        const code = 'INH-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+        savedProgress[code] = {
+            name: data.name,
+            progress: data.progress,
+            time: data.time
+        };
         socket.emit('progress-saved', code);
     });
 
-    // 讀取雲端繼承碼進度
+    // 載入遊戲進度
     socket.on('load-progress', (code) => {
-        const data = globalData.get(code);
+        const data = savedProgress[code];
         socket.emit('progress-loaded', data || null);
     });
 
-    // 遊戲內即時座標同步
-    socket.on('player-update', (data) => {
-        if (socket.currentRoom && rooms[socket.currentRoom] && rooms[socket.currentRoom].players[socket.id]) {
-            rooms[socket.currentRoom].players[socket.id] = { ...rooms[socket.currentRoom].players[socket.id], ...data };
-            socket.to(socket.currentRoom).emit('opponent-move', rooms[socket.currentRoom].players);
+    // 取得排行榜資料
+    socket.on('get-leaderboard', () => {
+        let list = [];
+        for (let code in savedProgress) {
+            let entry = savedProgress[code];
+            if (entry.progress && Object.keys(entry.progress).length > 0) {
+                for (let trackId in entry.progress) {
+                    list.push({
+                        track: trackId,
+                        name: entry.name,
+                        time: entry.time || '00:00'
+                    });
+                }
+            }
+        }
+        list.sort((a, b) => {
+            let ta = a.time.split(':');
+            let tb = b.time.split(':');
+            return (parseInt(ta[0]) * 60 + parseInt(ta[1])) - (parseInt(tb[0]) * 60 + parseInt(tb[1]));
+        });
+        socket.emit('leaderboard-data', list.slice(0, 20));
+    });
+
+    // 上傳通關成績
+    socket.on('upload-score', (data) => {
+        let existing = leaderboard.find(e => e.track === data.track && e.name === data.name);
+        if (existing) {
+            let cur = data.time.split(':');
+            let old = existing.time.split(':');
+            let curSec = parseInt(cur[0]) * 60 + parseInt(cur[1]);
+            let oldSec = parseInt(old[0]) * 60 + parseInt(old[1]);
+            if (curSec < oldSec) {
+                existing.time = data.time;
+            }
+        } else {
+            leaderboard.push({ track: data.track, name: data.name, time: data.time });
         }
     });
 
+    // 玩家離開或斷線
     socket.on('disconnect', () => {
-        if (socket.currentRoom && rooms[socket.currentRoom]) {
-            delete rooms[socket.currentRoom].players[socket.id];
-            io.to(socket.currentRoom).emit('update-room-users', rooms[socket.currentRoom].players);
+        console.log(`玩家斷線了: ${socket.id}`);
+        const roomId = socket.currentRoom;
+        if (roomId && rooms[roomId]) {
+            delete rooms[roomId].players[socket.id];
+            // 若房主離開，自動指定新房主
+            let remaining = Object.keys(rooms[roomId].players);
+            if (remaining.length > 0) {
+                if (!rooms[roomId].hostId || !rooms[roomId].players[rooms[roomId].hostId]) {
+                    rooms[roomId].hostId = remaining[0];
+                }
+                io.to(roomId).emit('update-room-users', rooms[roomId].players, rooms[roomId].hostId);
+            } else {
+                delete rooms[roomId];
+            }
         }
     });
 });
 
-server.listen(process.env.PORT || 3000, () => console.log('Server Live'));
+// 啟動伺服器
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`多人對戰伺服器已在 port ${PORT} 啟動運行！`);
+});
