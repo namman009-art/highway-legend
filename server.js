@@ -1,6 +1,8 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,9 +16,26 @@ const io = new Server(server, {
 // 動態房間管理
 const rooms = {};
 
-// 進度儲存與排行榜
-const savedProgress = {};
-const leaderboard = [];
+// 持久化檔案路徑
+const DATA_FILE = path.join(__dirname, 'game-data.json');
+
+// 載入持久化資料
+let savedProgress = {};
+let leaderboard = [];
+try {
+    if (fs.existsSync(DATA_FILE)) {
+        const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+        savedProgress = data.savedProgress || {};
+        leaderboard = data.leaderboard || [];
+        console.log(`已載入存檔資料：${Object.keys(savedProgress).length} 筆進度、${leaderboard.length} 筆排行榜`);
+    }
+} catch(e) { console.log('載入存檔失敗，使用空資料', e.message); }
+
+function saveData() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify({ savedProgress, leaderboard }));
+    } catch(e) { console.log('存檔失敗', e.message); }
+}
 
 io.on('connection', (socket) => {
     console.log(`有玩家連線進來了: ${socket.id}`);
@@ -100,6 +119,7 @@ io.on('connection', (socket) => {
             time: data.time
         };
         socket.emit('progress-saved', code);
+        saveData();
     });
 
     // 載入遊戲進度
@@ -108,43 +128,34 @@ io.on('connection', (socket) => {
         socket.emit('progress-loaded', data || null);
     });
 
-    // 取得排行榜資料
+    // 取得排行榜資料（從 leaderboard 陣列讀取）
     socket.on('get-leaderboard', () => {
-        let list = [];
-        for (let code in savedProgress) {
-            let entry = savedProgress[code];
-            if (entry.progress && Object.keys(entry.progress).length > 0) {
-                for (let trackId in entry.progress) {
-                    list.push({
-                        track: trackId,
-                        name: entry.name,
-                        time: entry.time || '00:00'
-                    });
-                }
-            }
-        }
+        let list = leaderboard.map(e => ({ track: e.track, name: e.name, time: e.time }));
         list.sort((a, b) => {
             let ta = a.time.split(':');
             let tb = b.time.split(':');
-            return (parseInt(ta[0]) * 60 + parseInt(ta[1])) - (parseInt(tb[0]) * 60 + parseInt(tb[1]));
+            return (parseInt(ta[0]) * 60 + parseInt(ta[1]) + (parseFloat(ta[2]) || 0)) - (parseInt(tb[0]) * 60 + parseInt(tb[1]) + (parseFloat(tb[2]) || 0));
         });
-        socket.emit('leaderboard-data', list.slice(0, 20));
+        socket.emit('leaderboard-data', list.slice(0, 30));
     });
 
     // 上傳通關成績
     socket.on('upload-score', (data) => {
+        if(!data || !data.track || !data.name || !data.time) return;
         let existing = leaderboard.find(e => e.track === data.track && e.name === data.name);
         if (existing) {
-            let cur = data.time.split(':');
-            let old = existing.time.split(':');
-            let curSec = parseInt(cur[0]) * 60 + parseInt(cur[1]);
-            let oldSec = parseInt(old[0]) * 60 + parseInt(old[1]);
+            let ta = data.time.split(':');
+            let to = existing.time.split(':');
+            let curSec = parseInt(ta[0]) * 60 + parseInt(ta[1]) + (parseFloat(ta[2]) || 0);
+            let oldSec = parseInt(to[0]) * 60 + parseInt(to[1]) + (parseFloat(to[2]) || 0);
             if (curSec < oldSec) {
                 existing.time = data.time;
             }
         } else {
             leaderboard.push({ track: data.track, name: data.name, time: data.time });
         }
+        saveData();
+        console.log(`排行榜更新: ${data.name} - ${data.track} - ${data.time}`);
     });
 
     // 玩家離開或斷線
