@@ -27,31 +27,50 @@ io.on('connection', (socket) => {
 
     // 獲取排行榜
     socket.on('get-leaderboard', () => {
-        leaderboard.sort((a, b) => a.ms - b.ms); // 依秒數排序
-        socket.emit('leaderboard-data', leaderboard.slice(0, 10)); // 回傳前 10 名
+        leaderboard.sort((a, b) => a.ms - b.ms); // 依秒數由小到大排序 (計時最短優先)
+        socket.emit('leaderboard-data', leaderboard.slice(0, 10)); // 僅回傳前 10 名
     });
 
-    // 儲存進度與通關時間
-    socket.on('save-progress', (data) => {
-        const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-        globalData.set(code, { name: data.name, progress: data.progress });
-        
-        if(data.time && data.time !== "00:00.000") {
+    // 自動上傳成績事件 (加入賽道分類與防重複洗榜)
+    socket.on('upload-score', (data) => {
+        if(data.time && data.time !== "00:00.000" && data.time !== "00:00") {
             let parts = data.time.split(':');
             if(parts.length === 2) {
                 let secs = parts[1].split('.');
-                let ms = parseInt(parts[0]) * 60000 + parseInt(secs[0]) * 1000 + parseInt(secs[1]);
-                leaderboard.push({ name: data.name, time: data.time, ms: ms });
+                let ms = parseInt(parts[0]) * 60000 + parseInt(secs[0]) * 1000 + (secs[1] ? parseInt(secs[1]) : 0);
+
+                // 檢查是否已有該玩家在「同一賽道」的成績
+                let existingIndex = leaderboard.findIndex(r => r.name === data.name && r.track === data.track);
+                if (existingIndex !== -1) {
+                    // 若新成績比舊成績快，則覆蓋
+                    if (ms < leaderboard[existingIndex].ms) {
+                        leaderboard[existingIndex].time = data.time;
+                        leaderboard[existingIndex].ms = ms;
+                    }
+                } else {
+                    // 沒有紀錄則直接新增
+                    leaderboard.push({ name: data.name, track: data.track, time: data.time, ms: ms });
+                }
+                // 重新排序
+                leaderboard.sort((a, b) => a.ms - b.ms);
             }
         }
+    });
+
+    // 儲存雲端繼承碼進度
+    socket.on('save-progress', (data) => {
+        const code = Math.random().toString(36).substring(2, 10).toUpperCase();
+        globalData.set(code, { name: data.name, progress: data.progress });
         socket.emit('progress-saved', code);
     });
 
+    // 讀取雲端繼承碼進度
     socket.on('load-progress', (code) => {
         const data = globalData.get(code);
         socket.emit('progress-loaded', data || null);
     });
 
+    // 遊戲內即時座標同步
     socket.on('player-update', (data) => {
         if (socket.currentRoom && rooms[socket.currentRoom] && rooms[socket.currentRoom].players[socket.id]) {
             rooms[socket.currentRoom].players[socket.id] = { ...rooms[socket.currentRoom].players[socket.id], ...data };
